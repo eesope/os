@@ -4,10 +4,12 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/wait.h>
+#include <signal.h>
 
 #define MAX_INPUT_SIZE 1024
 #define MAX_TOKEN_SIZE 64
 #define MAX_NUM_TOKENS 64
+#define MAX_BG_PROCESSES 64
 
 /**
  * Splits the string by space and returns the array of tokens.
@@ -39,20 +41,7 @@ char **tokenize(char *line) {
 }
 
 /**
- * Clean zombie up
- */
-void reap_zombie() {
-    int status;
-    pid_t wpid;
-
-    // WNOHANG: non-block; if no zombie child just pass
-    while ((wpid = waitpid(-1, &status, WNOHANG)) > 0) {
-        printf("Shell: Background process finished (PID=%d)\n", wpid);
-    }
-}
-
-/**
- * Accept user input keep it in line buffer 
+ * Accept user input keep it in line buffer.
  */
 int read_input(char *line, int size) {
     bzero(line, size);
@@ -66,8 +55,35 @@ int read_input(char *line, int size) {
     return 1;
 }
 
+/*
+* enum for command types
+*/ 
+typedef enum {
+    CMD_NONE,
+    CMD_CD,
+    CMD_EXIT,
+    CMD_OTHER
+} CommandType;
+
+/* 
+* Parse tokens[0] and return enum value
+*/
+CommandType parse_cmd (char *cmd) {
+    if (cmd == NULL) {
+        return CMD_NONE;
+    }
+    if (strcmp(cmd, "cd") == 0) {
+        return CMD_CD;
+    }
+    if (strcmp(cmd, "exit") == 0) {
+        return CMD_EXIT;
+    }
+    return CMD_OTHER;
+}
+
+
 /**
- * is &? 
+ * is there & ? 
  * -> yes, put flag 1 (background) 
  * -> no, put flag 0 (foreground)
  */
@@ -85,16 +101,11 @@ int check_background(char **tokens) {
     return 0;
 }
 
-/**
- * is cd?
- */
 void handle_cd(char **tokens) {
-    // tokens[0] = "cd"
     if (tokens[1] == NULL) {
         fprintf(stderr, "Shell: Incorrect command\n");
     } 
     else if (strcmp(tokens[1], "..") == 0) {
-        // "cd .."
         if (chdir("..") != 0) {
             fprintf(stderr, "Shell: Incorrect command\n");
         }
@@ -105,6 +116,32 @@ void handle_cd(char **tokens) {
             fprintf(stderr, "Shell: Incorrect command\n");
         }
     }
+}
+
+// Data structure for background processes
+pid_t bg_pids[MAX_BG_PROCESSES];
+int bg_count = 0;
+
+/*
+* Count the pid of background processes in the array.
+*/ 
+void add_bg_pid (pid_t pid) {
+	if (bg_count < MAX_BG_PROCESSES) {
+		bg_pids[bg_count++] = pid;
+	}
+	else {
+		fprintf(stderr, "Too many background processes for this computer.\n");
+	}
+}
+
+void rm_bg_pid (pid_t pid) {
+	for(int i = 0; i < bg_count; i++) {
+		if (bg_pids[i] == pid) {
+			bg_pids[i] = bg_pids[bg_count - 1];
+			bg_count--;
+			break;
+		}
+	}
 }
 
 /**
@@ -132,15 +169,30 @@ void execute_command(char **tokens, int is_bg) {
             waitpid(pid, &status, 0);
         } else {
             // background
+			add_bg_pid(pid);
             printf("Shell: background process started (PID=%d)\n", pid);
         }
     }
 }
 
+/**
+ * Clean zombie up
+ */
+void reap_zombie() {
+    int status;
+    pid_t wpid;
+
+    // WNOHANG: non-block; if no zombie child just pass
+    while ((wpid = waitpid(-1, &status, WNOHANG)) > 0) {
+		rm_bg_pid(wpid);
+        printf("Shell: Background process finished (PID=%d)\n", wpid);
+    }
+}
+
+
 int main(int argc, char* argv[]) {
     char line[MAX_INPUT_SIZE];            
     char **tokens;              
-    int i;
 
     while (1) {
         reap_zombie();
@@ -165,16 +217,33 @@ int main(int argc, char* argv[]) {
 		// is there & ?
         int is_bg = check_background(tokens);
 
-		// is this cd ?
-        if (strcmp(tokens[0], "cd") == 0) {
-            handle_cd(tokens);
-        }
+		// parse command line
+		CommandType cmd_type = parse_cmd(tokens[0]);
 
-		// other than cd command line
-        else {
-            execute_command(tokens, is_bg);
-        }
+		switch (cmd_type)
+		{
+		case CMD_NONE:
+			break;
 
+		case CMD_CD:
+			handle_cd(tokens);
+			break;
+
+		case CMD_EXIT:
+			for (int i = 0; i < bg_count; i++) {
+				kill(bg_pids[i], SIGTERM);
+			}
+			free(tokens);	
+			reap_zombie();		
+			goto END_OF_LOOP;
+
+		case CMD_OTHER:
+		default:
+			execute_command(tokens, is_bg);
+			break;
+		}
+
+		int i;
         // dismiss tokens
         for(i = 0; tokens[i] != NULL; i++) {
             free(tokens[i]);
@@ -182,6 +251,7 @@ int main(int argc, char* argv[]) {
         free(tokens);
     }
 
+	END_OF_LOOP:
     reap_zombie();
     return 0;
 }
