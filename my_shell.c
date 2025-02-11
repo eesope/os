@@ -144,31 +144,54 @@ void rm_bg_pid (pid_t pid) {
 	}
 }
 
+void sig_handler (int signum) {
+    printf("\nsignal#: %d\n", signum);
+    switch (signum) {
+        case 2:
+            // terminate current foreground process
+            exit(0);
+    }    
+}
+
 /**
  * fork() -> execvp() to lookup user/bin
  * act upon is_bg? 0 (no &) | 1 (yes &)
  */
 void execute_command(char **tokens, int is_bg) {
     pid_t pid = fork();
+
     if (pid < 0) {
         fprintf(stderr, "Fork failed\n");
         return;
     }
     else if (pid == 0) {
         // child
+        setpgid(0, 0); // have as new process group
+        
+        // replace signal(SIGINT, SIG_DFL); 
+        // child listens signal
+
         if (execvp(tokens[0], tokens) == -1) {
             fprintf(stderr, "Shell: Incorrect command\n");
         }
-        exit(1);
+        _exit(0);
     }
     else {
         // parent
         if (is_bg == 0) {
             // foreground
+            tcsetpgrp(STDIN_FILENO, pid); // child PGID to foreground by parent
+            // STDIN_FILENO == terminal
+
             int status;
             waitpid(pid, &status, 0);
+
+            // if foreground process terminated
+            tcsetpgrp(STDIN_FILENO, getpgrp()); // return shell as master of terminal
+
         } else {
             // background
+            setpgid(pid, pid);
 			add_bg_pid(pid);
             printf("Shell: background process started (PID=%d)\n", pid);
         }
@@ -193,6 +216,9 @@ void reap_zombie() {
 int main(int argc, char* argv[]) {
     char line[MAX_INPUT_SIZE];            
     char **tokens;              
+
+    // parent ignore signal
+    signal(SIGINT, sig_handler);
 
     while (1) {
         reap_zombie();
@@ -234,7 +260,7 @@ int main(int argc, char* argv[]) {
 				kill(bg_pids[i], SIGTERM);
 			}
 			free(tokens);	
-			reap_zombie();		
+			reap_zombie();
 			goto END_OF_LOOP;
 
 		case CMD_OTHER:
