@@ -34,7 +34,6 @@ char **tokenize(char *line) {
             token[tokenIndex++] = readChar;
         }
     }
-
     free(token);
     tokens[tokenNo] = NULL;
     return tokens;
@@ -81,18 +80,16 @@ CommandType parse_cmd (char *cmd) {
     return CMD_OTHER;
 }
 
-
 /**
  * is there & ? 
  * -> yes, put flag 1 (background) 
  * -> no, put flag 0 (foreground)
  */
-int check_background(char **tokens) {
+int is_bg_sig(char **tokens) {
     int last_index = 0;
     while (tokens[last_index] != NULL) {
         last_index++;
     }
-
     if (last_index > 0 && strcmp(tokens[last_index - 1], "&") == 0) {
         free(tokens[last_index - 1]);
         tokens[last_index - 1] = NULL;
@@ -144,60 +141,6 @@ void rm_bg_pid (pid_t pid) {
 	}
 }
 
-void sig_handler (int signum) {
-    printf("\nsignal#: %d\n", signum);
-    switch (signum) {
-        case 2:
-            // terminate current foreground process
-            exit(0);
-    }    
-}
-
-/**
- * fork() -> execvp() to lookup user/bin
- * act upon is_bg? 0 (no &) | 1 (yes &)
- */
-void execute_command(char **tokens, int is_bg) {
-    pid_t pid = fork();
-
-    if (pid < 0) {
-        fprintf(stderr, "Fork failed\n");
-        return;
-    }
-    else if (pid == 0) {
-        // child
-        setpgid(0, 0); // have as new process group
-        
-        // replace signal(SIGINT, SIG_DFL); 
-        // child listens signal
-
-        if (execvp(tokens[0], tokens) == -1) {
-            fprintf(stderr, "Shell: Incorrect command\n");
-        }
-        _exit(0);
-    }
-    else {
-        // parent
-        if (is_bg == 0) {
-            // foreground
-            tcsetpgrp(STDIN_FILENO, pid); // child PGID to foreground by parent
-            // STDIN_FILENO == terminal
-
-            int status;
-            waitpid(pid, &status, 0);
-
-            // if foreground process terminated
-            tcsetpgrp(STDIN_FILENO, getpgrp()); // return shell as master of terminal
-
-        } else {
-            // background
-            setpgid(pid, pid);
-			add_bg_pid(pid);
-            printf("Shell: background process started (PID=%d)\n", pid);
-        }
-    }
-}
-
 /**
  * Clean zombie up
  */
@@ -212,14 +155,147 @@ void reap_zombie() {
     }
 }
 
+void sig_handler (int signum) {
+    // printf("\nsignal#: %d\n", signum);
+    switch (signum) {
+        case 2:
+            // terminate current foreground process
+            exit(0);
+    }    
+}
 
+char **split_by_delim(char *line, const char *delim, int *num_cmds) {
+    char **commands = malloc(MAX_NUM_TOKENS * sizeof(char *));
+    int count = 0;
+    char *token = strtok(line, delim);
+
+    while (token != NULL && count < MAX_NUM_TOKENS) {
+        commands[count++] = strdup(token); // duplicate str arr
+        token = strtok(NULL, delim);
+    }
+    commands[count] = NULL;
+    if (num_cmds)
+        *num_cmds = count;
+    return commands;
+}
+
+/**
+ * fork() -> execvp() to lookup user/bin
+ * act upon is_bg? 0 (no &) | 1 (yes &)
+ */
+void execute_command(char **tokens, int is_bg) {
+    pid_t child_pid = fork();
+    // printf("0 child pid: %d\n", child_pid);
+    // printf("0 parent pid: %d\n", getpid());
+
+    if (child_pid < 0) {
+        fprintf(stderr, "Fork failed\n");
+        return;
+    }
+    else if (child_pid == 0) {
+        // actual executing cmd
+
+        // this process listens signal
+        signal(SIGINT, SIG_DFL);
+
+        if (execvp(tokens[0], tokens) == -1) { // execute and checkup
+            fprintf(stderr, "Shell: Incorrect command\n");
+        }
+        _exit(0);
+    }
+    else {
+        // if successfully forked @1st line of function
+        // check whether bg process or not 
+
+        if (is_bg == 0) {
+            // foreground
+
+            // mk child PGID independent on foreground
+            tcsetpgrp(STDIN_FILENO, child_pid);
+            // STDIN_FILENO == terminal
+
+            int status;
+            waitpid(child_pid, &status, 0);
+
+            // return shell to parent
+            tcsetpgrp(STDIN_FILENO, getpgrp()); 
+
+        } else {
+            // background
+            setpgid(child_pid, child_pid);
+			add_bg_pid(child_pid);
+            printf("Shell: background process started (PID=%d)\n", child_pid);
+        }
+    }
+}
+
+void execute_serial(char *line) {
+    int num_cmds = 0;
+    char **cmds = split_by_delim(line, "&&", &num_cmds);
+    for (int i = 0; i < num_cmds; i++) {
+        char **tokens = tokenize(cmds[i]);
+        // serial foreground -> is_bg = 0
+        execute_command(tokens, 0);
+        
+        for (int j = 0; tokens[j] != NULL; j++) {
+            free(tokens[j]);
+        }
+        free(tokens);
+        free(cmds[i]);
+
+        // if interrupted by ctrl+c 
+        if (SIGINFO == 2) {
+            break;
+        }
+    }
+    free(cmds);
+}
+
+void execute_parallel(char *line) {
+    int num_cmds = 0;
+    char **cmds = split_by_delim(line, "&&&", &num_cmds);
+    pid_t pids[MAX_NUM_TOKENS];
+    for (int i = 0; i < num_cmds; i++) {
+        char **tokens = tokenize(cmds[i]);
+        pid_t pid = fork();
+        if (pid < 0) {
+            fprintf(stderr, "Fork failed\n");
+        } else if (pid == 0) {
+            setpgid(0, 0);
+            signal(SIGINT, SIG_DFL);
+            if (execvp(tokens[0], tokens) == -1) {
+                fprintf(stderr, "Shell: Incorrect command\n");
+            }
+            _exit(0);
+        } else {
+            pids[i] = pid;
+        }
+        for (int j = 0; tokens[j] != NULL; j++) {
+            free(tokens[j]);
+        }
+        free(tokens);
+        free(cmds[i]);
+    }
+    free(cmds);
+    // Wait for all parallel commands to finish
+    for (int i = 0; i < num_cmds; i++) {
+        int status;
+        waitpid(pids[i], &status, 0);
+    }
+    tcsetpgrp(STDIN_FILENO, getpgrp());
+}
+
+
+/**
+ * Drive the program. 
+*/ 
 int main(int argc, char* argv[]) {
     char line[MAX_INPUT_SIZE];            
-    char **tokens;              
+    char **tokens;
 
-    // parent ignore signal
-    signal(SIGINT, sig_handler);
-
+    // signal ignored in parent process
+    signal(SIGINT, SIG_IGN);
+    
     while (1) {
         reap_zombie();
 
@@ -233,16 +309,25 @@ int main(int argc, char* argv[]) {
         }
 
         line[strlen(line)] = '\n'; 
+        // pared one separate command
         tokens = tokenize(line);
 
-        if (tokens[0] == NULL) {
-            free(tokens);
-            continue;
+        if (strstr(line, "&&&") != NULL) {
+            execute_parallel(line);
+        } 
+        else if (strstr(line, "&&") != NULL) {
+            execute_serial(line);
+        } 
+        else { // single command execution
+            tokens = tokenize(line);
+            if (tokens[0] == NULL) {
+                free(tokens);
+                continue;
+            }
         }
-
 		// is there & ?
-        int is_bg = check_background(tokens);
-
+        int is_bg = is_bg_sig(tokens);
+        
 		// parse command line
 		CommandType cmd_type = parse_cmd(tokens[0]);
 
