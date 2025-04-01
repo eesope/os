@@ -1,0 +1,5 @@
+gcc -o test-writer-pref test-writer-pref.c rwlock-writer-pref.c -lpthread
+gcc -o test-reader-pref test-reader-pref.c rwlock-reader-pref.c -lpthread
+
+./test-reader-pref 10 5
+./test-writer-pref 10 5
